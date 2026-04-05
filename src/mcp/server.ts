@@ -9,6 +9,8 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -38,6 +40,21 @@ type SearchResultItem = {
   score: number;
   context: string | null;
   snippet: string;
+  explain?: {
+    ftsScores: number[];
+    vectorScores: number[];
+    rrf: {
+      rank: number;
+      positionScore: number;
+      weight: number;
+      baseScore: number;
+      topRankBonus: number;
+      totalScore: number;
+      contributions: { source: string; queryType: string; rank: number; rrfContribution: number }[];
+    };
+    rerankScore: number;
+    blendedScore: number;
+  };
 };
 
 type StatusResult = {
@@ -78,6 +95,16 @@ function formatSearchSummary(results: SearchResultItem[], query: string): string
     lines.push(`${r.docid} ${Math.round(r.score * 100)}% ${r.file} - ${r.title}`);
   }
   return lines.join('\n');
+}
+
+function getPackageVersion(): string {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "../../package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 // =============================================================================
@@ -157,7 +184,7 @@ async function buildInstructions(store: QMDStore): Promise<string> {
  */
 async function createMcpServer(store: QMDStore): Promise<McpServer> {
   const server = new McpServer(
-    { name: "qmd", version: "0.9.9" },
+    { name: "qmd", version: getPackageVersion() },
     { instructions: await buildInstructions(store) },
   );
 
@@ -253,11 +280,12 @@ Combine types for best results. First sub-query gets 2× weight — put your str
 
 | Goal | Approach |
 |------|----------|
+| General search (recommended) | Use \`query\` parameter — auto-expands via trained model |
 | Know exact term/name | \`lex\` only |
 | Concept search | \`vec\` only |
 | Best recall | \`lex\` + \`vec\` |
 | Complex/nuanced | \`lex\` + \`vec\` + \`hyde\` |
-| Unknown vocabulary | Use a standalone natural-language query (no typed lines) so the server can auto-expand it |
+| Unknown vocabulary | Use \`query\` parameter with natural language so the server auto-expands it |
 
 ## Examples
 
@@ -284,8 +312,14 @@ Intent-aware lex (C++ performance, not sports):
 \`\`\``,
       annotations: { readOnlyHint: true, openWorldHint: false },
       inputSchema: {
-        searches: z.array(subSearchSchema).min(1).max(10).describe(
-          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight."
+        query: z.string().optional().describe(
+          "Plain text query — auto-expanded by the trained model into lex/vec/hyde " +
+          "variants, then fused via RRF and reranked. Recommended default for most searches. " +
+          "Mutually exclusive with 'searches'."
+        ),
+        searches: z.array(subSearchSchema).max(10).optional().describe(
+          "Typed sub-queries to execute (lex/vec/hyde). First gets 2x weight. " +
+          "Use for precise control over retrieval strategy. Mutually exclusive with 'query'."
         ),
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
@@ -299,31 +333,62 @@ Intent-aware lex (C++ performance, not sports):
         rerank: z.boolean().optional().default(true).describe(
           "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
+        explain: z.boolean().optional().default(false).describe(
+          "Include retrieval score traces (FTS scores, vector scores, RRF fusion breakdown, " +
+          "rerank blend weights) in each result. Useful for debugging query quality and search tuning."
+        ),
       },
     },
-    async ({ searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
-      // Map to internal format
-      const queries: ExpandedQuery[] = searches.map(s => ({
-        type: s.type,
-        query: s.query,
-      }));
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank, explain }) => {
+      // Validate: exactly one of query/searches should be provided
+      if (!query && (!searches || searches.length === 0)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Error: provide either 'query' (plain text) or 'searches' (typed sub-queries)",
+          }],
+          isError: true,
+        };
+      }
+      if (query && searches && searches.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Error: 'query' and 'searches' are mutually exclusive; provide only one",
+          }],
+          isError: true,
+        };
+      }
 
-      // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
-
-      const results = await store.search({
-        queries,
+      const commonOpts = {
         collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
+        candidateLimit,
         rerank,
         intent,
-      });
+        explain,
+      };
 
-      // Use first lex or vec query for snippet extraction
-      const primaryQuery = searches.find(s => s.type === 'lex')?.query
-        || searches.find(s => s.type === 'vec')?.query
-        || searches[0]?.query || "";
+      let results;
+      let primaryQuery: string;
+
+      if (query) {
+        primaryQuery = query;
+        results = await store.search({ query, ...commonOpts });
+      } else {
+        const queries: ExpandedQuery[] = (searches ?? []).map(s => ({
+          type: s.type,
+          query: s.query,
+        }));
+
+        primaryQuery = searches?.find(s => s.type === 'lex')?.query
+          || searches?.find(s => s.type === 'vec')?.query
+          || searches?.[0]?.query || "";
+
+        results = await store.search({ queries, ...commonOpts });
+      }
 
       const filtered: SearchResultItem[] = results.map(r => {
         const { line, snippet } = extractSnippet(r.bestChunk, primaryQuery, 300, undefined, undefined, intent);
@@ -334,6 +399,7 @@ Intent-aware lex (C++ performance, not sports):
           score: Math.round(r.score * 100) / 100,
           context: r.context,
           snippet: addLineNumbers(snippet, line),
+          ...(r.explain ? { explain: r.explain } : {}),
         };
       });
 
@@ -506,7 +572,7 @@ Intent-aware lex (C++ performance, not sports):
       ];
 
       for (const col of status.collections) {
-        summary.push(`    - ${col.path} (${col.documents} docs)`);
+        summary.push(`    - ${col.name}: ${col.path} (${col.documents} docs)`);
       }
 
       return {
@@ -653,6 +719,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
           limit: params.limit ?? 10,
           minScore: params.minScore ?? 0,
           intent: params.intent,
+          explain: params.explain ?? false,
         });
 
         // Use first lex or vec query for snippet extraction
@@ -669,6 +736,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
             score: Math.round(r.score * 100) / 100,
             context: r.context,
             snippet: addLineNumbers(snippet, line),
+            ...(r.explain ? { explain: r.explain } : {}),
           };
         });
 

@@ -167,9 +167,23 @@ export function findCodeFences(text: string): CodeFenceRegion[] {
 
 /**
  * Check if a position is inside a code fence region.
+ * Uses binary search since fences are sorted by start position.
  */
 export function isInsideCodeFence(pos: number, fences: CodeFenceRegion[]): boolean {
-  return fences.some(f => pos > f.start && pos < f.end);
+  if (fences.length === 0) return false;
+  // Binary search: find the last fence whose start < pos
+  let lo = 0, hi = fences.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (fences[mid]!.start < pos) {
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  // hi is now the index of the last fence with start < pos (or -1 if none)
+  if (hi < 0) return false;
+  return pos < fences[hi]!.end;
 }
 
 /**
@@ -196,9 +210,21 @@ export function findBestCutoff(
   let bestScore = -1;
   let bestPos = targetCharPos;
 
-  for (const bp of breakPoints) {
-    if (bp.pos < windowStart) continue;
-    if (bp.pos > targetCharPos) break;  // sorted, so we can stop
+  // Binary search for the first break point >= windowStart
+  let lo = 0, hi = breakPoints.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (breakPoints[mid]!.pos < windowStart) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  // Iterate only within the [windowStart, targetCharPos] range
+  for (let i = lo; i < breakPoints.length; i++) {
+    const bp = breakPoints[i]!;
+    if (bp.pos > targetCharPos) break;
 
     // Skip break points inside code fences
     if (isInsideCodeFence(bp.pos, codeFences)) continue;
@@ -1053,7 +1079,12 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
     const hasCosine = tableInfo.sql.includes('distance_metric=cosine');
     const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
     if (existingDims === dimensions && hasHashSeq && hasCosine) return;
-    // Table exists but wrong schema - need to rebuild
+    if (existingDims !== null && existingDims !== dimensions) {
+      throw new Error(
+        `Embedding dimension mismatch: existing vectors are ${existingDims}d but the current model produces ${dimensions}d. ` +
+        `Run 'qmd embed -f' to re-embed with the new model.`
+      );
+    }
     db.exec("DROP TABLE IF EXISTS vectors_vec");
   }
   db.exec(`CREATE VIRTUAL TABLE vectors_vec USING vec0(hash_seq TEXT PRIMARY KEY, embedding float[${dimensions}] distance_metric=cosine)`);
@@ -1465,13 +1496,21 @@ export async function generateEmbeddings(
       }
 
       if (!vectorTableInitialized) {
-        const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-        const firstResult = await session.embed(firstText);
-        if (!firstResult) {
-          throw new Error("Failed to get embedding dimensions from first chunk");
+        // Try chunks until one succeeds — oversized chunks may exceed context window
+        let initResult: { embedding: number[] } | null = null;
+        for (const chunk of batchChunks) {
+          const text = formatDocForEmbedding(chunk.text, chunk.title);
+          try {
+            initResult = await session.embed(text);
+            if (initResult) break;
+          } catch {
+            // Skip oversized/failed chunks, try next
+          }
         }
-        store.ensureVecTable(firstResult.embedding.length);
+        if (!initResult) {
+          throw new Error("Failed to get embedding dimensions — all chunks may exceed context window");
+        }
+        store.ensureVecTable(initResult.embedding.length);
         vectorTableInitialized = true;
       }
 
@@ -2763,7 +2802,7 @@ export function getTopLevelPathsWithoutContext(db: Database, collectionName: str
 // =============================================================================
 
 function sanitizeFTS5Term(term: string): string {
-  return term.replace(/[^\p{L}\p{N}']/gu, '').toLowerCase();
+  return term.replace(/[^\p{L}\p{N}'_-]/gu, '').toLowerCase();
 }
 
 /**
@@ -2895,7 +2934,7 @@ function buildFTS5Query(query: string): string | null {
  */
 export function validateSemanticQuery(query: string): string | null {
   // Check for negation syntax
-  if (/-\w/.test(query) || /-"/.test(query)) {
+  if (/(?:^|\s)-[\w"]/.test(query)) {
     return 'Negation (-term) is not supported in vec/hyde queries. Use lex for exclusions.';
   }
   return null;
