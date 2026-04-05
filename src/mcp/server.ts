@@ -360,23 +360,23 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      // Use default collections if none specified
       const effectiveCollections = collections ?? defaultCollectionNames;
+      const commonOpts = {
+        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+        limit,
+        minScore,
+        candidateLimit,
+        rerank,
+        intent,
+        explain,
+      };
 
       let results;
       let primaryQuery: string;
 
       if (query) {
         primaryQuery = query;
-        results = await store.search({
-          query,
-          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-          limit,
-          minScore,
-          rerank,
-          intent,
-          explain,
-        });
+        results = await store.search({ query, ...commonOpts });
       } else {
         const queries: ExpandedQuery[] = (searches ?? []).map(s => ({
           type: s.type,
@@ -387,15 +387,7 @@ Intent-aware lex (C++ performance, not sports):
           || searches?.find(s => s.type === 'vec')?.query
           || searches?.[0]?.query || "";
 
-        results = await store.search({
-          queries,
-          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
-          limit,
-          minScore,
-          rerank,
-          intent,
-          explain,
-        });
+        results = await store.search({ queries, ...commonOpts });
       }
 
       const filtered: SearchResultItem[] = results.map(r => {

@@ -369,7 +369,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // QMD_MODEL_KEEP_ALIVE=1  — disable inactivity timer entirely (models + contexts stay in RAM)
   // QMD_MODEL_TTL=<seconds> — override inactivity timeout (default: 300s / 5 min)
   const keepAlive = process.env.QMD_MODEL_KEEP_ALIVE === '1';
-  const ttlSec = Number(process.env.QMD_MODEL_TTL) || 300;
+  const ttlSec = process.env.QMD_MODEL_TTL !== undefined
+    ? Number(process.env.QMD_MODEL_TTL)
+    : 300;
   const llm = new LlamaCpp({
     inactivityTimeoutMs: keepAlive ? 0 : ttlSec * 1000,
     disposeModelsOnInactivity: !keepAlive,
